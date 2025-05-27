@@ -13,7 +13,6 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.static('public'));
 app.use(express.json());
 
 // Multer setup for file uploads - use /tmp directory for serverless
@@ -162,10 +161,6 @@ app.post("/api/caption", upload.single("image"), async (req, res) => {
       error: errorMessage 
     });
   }
-});
-
-app.get("/summarize", (req, res) => {
-  res.sendFile(path.join(__dirname, "/public", "summary.html"));
 });
 
 // Function to summarize YouTube video
