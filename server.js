@@ -34,7 +34,8 @@ async function compressToTargetSize(inputPath, outputPath, targetKB = 200) {
 app.post("/api/caption", upload.single("image"), async (req, res) => {
   try {
     const inputPath = req.file.path;
-    const outputPath = `uploads/compressed-${req.file.filename}.jpeg`;
+    // const outputPath = `uploads/compressed-${req.file.filename}.jpeg`;
+    const outputPath = path.join('/tmp', `compressed-${req.file.filename}.jpeg`);
 
     const buffer = await compressToTargetSize(inputPath, outputPath, 200);
     const base64Image = buffer.toString("base64");
