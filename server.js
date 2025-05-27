@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const multer = require("multer");
 const sharp = require("sharp");
+const cors = require('cors');
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
@@ -11,6 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Middleware
+app.use(cors());
 app.use(express.json());
 
 // Multer setup for file uploads - use /tmp directory for serverless
