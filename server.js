@@ -15,6 +15,12 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+app.get('/', (req, res) => {
+  res.send('Hello from Express.js!');
+});
+
+app.use(express.static('public'));
+
 // Multer setup for file uploads - use /tmp directory for serverless
 const upload = multer({ 
   dest: "/tmp/uploads/",
@@ -62,8 +68,12 @@ const cleanupFile = async (filePath) => {
   }
 };
 
+// app.get("/caption", (req, res) => {
+//   res.sendFile(path.join(__dirname, "/public", "index.html"));
+// });
+
 // API route to handle image upload and caption generation
-app.post("/api/caption", upload.single("image"), async (req, res) => {
+app.post("/caption", upload.single("image"), async (req, res) => {
   let inputPath = null;
   let outputPath = null;
 
@@ -167,64 +177,57 @@ app.post("/api/caption", upload.single("image"), async (req, res) => {
 async function summarizeYouTubeVideo(videoId) {
   try {
     console.log(`🎥 Processing video ID: ${videoId}`);
-
-    if (!videoId || typeof videoId !== 'string') {
-      throw new Error("Invalid video ID provided");
-    }
-
+    
     let transcriptData;
     let usedLanguage;
-
+    
+    // 1. Try to fetch Hindi transcript first, then fallback to English
     try {
-      console.log("Attempting to fetch Hindi transcript...");
-      transcriptData = await getSubtitles({ videoID: videoId, lang: "hi" });
-      usedLanguage = "Hindi";
-      console.log("✅ Hindi transcript found");
-    } catch {
-      console.log("❌ Hindi transcript not available, trying English...");
+      console.log('Attempting to fetch Hindi transcript...');
+      transcriptData = await getSubtitles({ videoID: videoId, lang: 'hi' });
+      usedLanguage = 'Hindi';
+      console.log('✅ Hindi transcript found');
+    } catch (error) {
+      console.log('❌ Hindi transcript not available, trying English...');
       try {
-        transcriptData = await getSubtitles({ videoID: videoId, lang: "en" });
-        usedLanguage = "English";
-        console.log("✅ English transcript found");
-      } catch {
-        console.log("❌ English transcript also not available, trying auto-generated...");
+        transcriptData = await getSubtitles({ videoID: videoId, lang: 'en' });
+        usedLanguage = 'English';
+        console.log('✅ English transcript found');
+      } catch (englishError) {
+        console.log('❌ English transcript also not available, trying auto-generated...');
         try {
           transcriptData = await getSubtitles({ videoID: videoId });
-          usedLanguage = "Auto-detected";
-          console.log("✅ Auto-generated transcript found");
-        } catch (transcriptError) {
-          throw new Error(`No transcript available for video ID: ${videoId}. Error: ${transcriptError.message}`);
+          usedLanguage = 'Auto-detected';
+          console.log('✅ Auto-generated transcript found');
+        } catch (autoError) {
+          throw new Error('No transcript found in Hindi, English, or auto-generated formats.');
         }
       }
     }
-
-    if (!transcriptData?.length) {
-      throw new Error("No transcript data available for this video");
+    
+    if (!transcriptData || transcriptData.length === 0) {
+      throw new Error('No transcript data available for this video.');
     }
-
-    const transcriptText = transcriptData
-      .map(item => item.text)
-      .join(" ")
-      .trim();
-
-    if (transcriptText.length < 10) {
-      throw new Error("Transcript too short to summarize");
+    
+    const transcriptText = transcriptData.map(item => item.text).join(' ');
+    console.log(`✅ Transcript found (${usedLanguage}): ${transcriptText.length} characters`);
+    
+    // 2. Prepare prompt for Gemini based on language used
+    let prompt;
+    if (usedLanguage === 'Hindi') {
+      prompt = `Summarize the following Hindi transcript of a YouTube video in Hindi:\n\n${transcriptText}`;
+    } else {
+      prompt = `Summarize the following English transcript of a YouTube video:\n\n${transcriptText}`;
     }
-
-    let prompt = usedLanguage === "Hindi"
-      ? `Summarize the following Hindi transcript of a YouTube video in Hindi. Provide a comprehensive summary covering the main points:\n\n${transcriptText}`
-      : `Summarize the following English transcript of a YouTube video. Provide a comprehensive summary covering the main points:\n\n${transcriptText}`;
-
-    console.log("🤖 Generating summary with Gemini...");
-
-    if (!process.env.GEMINI_API2_LINK || !process.env.GEMINI_API_KEY) {
-      throw new Error("Missing required environment variables: GEMINI_API2_LINK or GEMINI_API_KEY");
-    }
-
-    const modelNames = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"];
+    
+    // 3. Call Gemini API (using updated model name)
+    console.log('🤖 Generating summary with Gemini...');
+    
+    // Try different model names
+    const modelNames = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro'];
     let geminiResponse;
     let usedModel;
-
+    
     for (const modelName of modelNames) {
       try {
         console.log(`Trying model: ${modelName}`);
@@ -239,57 +242,60 @@ async function summarizeYouTubeVideo(videoId) {
           },
           {
             headers: {
-              "Content-Type": "application/json"
-            },
-            timeout: 30000 // 30 second timeout
+              'Content-Type': 'application/json'
+            }
           }
         );
         usedModel = modelName;
         console.log(`✅ Successfully used model: ${modelName}`);
         break;
       } catch (error) {
-        console.log(`❌ Error with model ${modelName}:`, error.response?.data || error.message);
         if (error.response?.status === 404) {
-          console.log(`Model ${modelName} not found, trying next...`);
-        } else if (modelNames.indexOf(modelName) === modelNames.length - 1) {
-          // Last model, throw the error
-          throw error;
+          console.log(`❌ Model ${modelName} not found, trying next...`);
+          continue;
+        } else {
+          throw error; // For non-404 errors, throw immediately
         }
       }
     }
-
+    
     if (!geminiResponse) {
-      throw new Error("All Gemini models failed to generate summary");
+      throw new Error('All Gemini models failed');
     }
-
-    const summary = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || "No summary generated.";
-
+    
+    // 4. Extract and return summary
+    const summary = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No summary generated.';
+    
+    console.log(`\n📊 Summary generated using ${usedModel} for ${usedLanguage} transcript:`);
     return {
       summary,
       transcriptLanguage: usedLanguage,
       modelUsed: usedModel
     };
-
+    
   } catch (error) {
-    console.error("❌ Error summarizing video:", error.message || error);
+    console.error('❌ Error summarizing video:', error.message || error);
     throw error;
   }
 }
 
+// app.get("/summarize", (req, res) => {
+//   res.sendFile(path.join(__dirname, "/public", "summary.html"));
+// });
+
+
 // API endpoint for summarizing
-app.post("/summarize", async (req, res) => {
+// API endpoint
+app.post('/summarize', async (req, res) => {
   try {
     const { videoId } = req.body;
-
+    
     if (!videoId) {
-      return res.status(400).json({ 
-        error: "videoId is required",
-        success: false 
-      });
+      return res.status(400).json({ error: 'videoId is required' });
     }
-
+    
     const result = await summarizeYouTubeVideo(videoId);
-
+    
     res.json({
       videoId,
       summary: result.summary,
@@ -297,42 +303,13 @@ app.post("/summarize", async (req, res) => {
       modelUsed: result.modelUsed,
       success: true
     });
+    
   } catch (error) {
-    console.error("❌ Error in /api/summarize:", error.message);
-    res.status(500).json({ 
+    res.status(500).json({
       error: error.message,
-      success: false 
+      success: false
     });
   }
-});
-
-// Health check endpoint
-app.get('/', (req, res) => {
-  res.json({ 
-    message: 'AI Caption & Summarizer API is running!',
-    timestamp: new Date().toISOString(),
-    endpoints: [
-      'POST /api/caption - Generate captions for images',
-      'POST /api/summarize - Summarize YouTube videos'
-    ]
-  });
-});
-
-// Global error handler
-app.use((error, req, res, next) => {
-  console.error('Global error handler:', error);
-  res.status(500).json({
-    success: false,
-    error: 'Internal server error'
-  });
-});
-
-// Handle 404
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Endpoint not found'
-  });
 });
 
 app.listen(PORT, () => {
