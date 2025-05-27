@@ -275,7 +275,7 @@ async function summarizeYouTubeVideo(videoId) {
 }
 
 // API endpoint for summarizing
-app.post("/api/summarize", async (req, res) => {
+app.post("/summarize", async (req, res) => {
   try {
     const { videoId } = req.body;
 
