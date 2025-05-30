@@ -6,81 +6,213 @@ const cors = require('cors');
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const cluster = require('cluster');
+const os = require('os');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
 const { getSubtitles } = require("youtube-captions-scraper");
 
+// Performance optimizations
 const app = express();
 const PORT = process.env.PORT || 3000;
+const numCPUs = os.cpus().length;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-app.get('/', (req, res) => {
-  res.send('Hello from Express.js!');
-});
-
-app.use(express.static('public'));
-
-// Multer setup for file uploads - use /tmp directory for serverless
-const upload = multer({ 
-  dest: "/tmp/uploads/",
-  limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+// Enable clustering for multiple users
+if (cluster.isMaster && process.env.NODE_ENV === 'production') {
+  console.log(`🚀 Master process ${process.pid} is running`);
+  
+  // Fork workers
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
   }
-});
-
-// Ensure /tmp/uploads directory exists
-const ensureUploadDir = () => {
-  const uploadDir = "/tmp/uploads";
-  if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-  }
-};
-
-// Compress image to target size (in KB)
-async function compressToTargetSize(inputPath, outputPath, targetKB = 200) {
-  try {
-    let quality = 80;
-    let buffer = await sharp(inputPath).jpeg({ quality }).toBuffer();
-
-    while (buffer.length / 1024 > targetKB && quality > 10) {
-      quality -= 5;
-      buffer = await sharp(inputPath).jpeg({ quality }).toBuffer();
-    }
-
-    // Write to output path
-    await fs.promises.writeFile(outputPath, buffer);
-    return buffer;
-  } catch (error) {
-    console.error("Error in image compression:", error);
-    throw error;
-  }
+  
+  cluster.on('exit', (worker, code, signal) => {
+    console.log(`Worker ${worker.process.pid} died. Restarting...`);
+    cluster.fork();
+  });
+} else {
+  startServer();
 }
 
-// Safe file cleanup
-const cleanupFile = async (filePath) => {
-  try {
-    if (fs.existsSync(filePath)) {
-      await fs.promises.unlink(filePath);
+function startServer() {
+  // Middleware for performance
+  app.use(compression()); // Enable gzip compression
+  
+  // Rate limiting to prevent abuse
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100, // Limit each IP to 100 requests per windowMs
+    message: {
+      error: 'Too many requests from this IP, please try again later.'
     }
-  } catch (error) {
-    console.warn(`Warning: Could not delete file ${filePath}:`, error.message);
+  });
+  app.use(limiter);
+
+  // Specific rate limits for heavy operations
+  const heavyOperationLimiter = rateLimit({
+    windowMs: 5 * 60 * 1000, // 5 minutes
+    max: 10, // Limit to 10 heavy operations per 5 minutes
+    message: {
+      error: 'Too many processing requests, please wait before trying again.'
+    }
+  });
+
+  // CORS with specific origins for better security
+  app.use(cors({
+    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    credentials: true
+  }));
+  
+  app.use(express.json({ limit: '10mb' }));
+
+  // Health check endpoint
+  app.get('/health', (req, res) => {
+    res.status(200).json({ 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(),
+      pid: process.pid 
+    });
+  });
+
+  app.get('/', (req, res) => {
+    res.json({ message: 'Express.js API Server', version: '2.0.0' });
+  });
+
+  // Optimized multer setup with memory storage for better performance
+  const upload = multer({ 
+    storage: multer.memoryStorage(), // Use memory instead of disk
+    limits: {
+      fileSize: 10 * 1024 * 1024, // 10MB limit
+      files: 1
+    },
+    fileFilter: (req, file, cb) => {
+      // Only allow image files
+      if (file.mimetype.startsWith('image/')) {
+        cb(null, true);
+      } else {
+        cb(new Error('Only image files are allowed'), false);
+      }
+    }
+  });
+
+  // Cache for API responses (simple in-memory cache)
+  const responseCache = new Map();
+  const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+  // Cache middleware
+  const cacheMiddleware = (keyGenerator) => {
+    return (req, res, next) => {
+      const key = keyGenerator(req);
+      const cached = responseCache.get(key);
+      
+      if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        console.log(`📦 Cache hit for key: ${key}`);
+        return res.json(cached.data);
+      }
+      
+      // Override res.json to cache the response
+      const originalJson = res.json;
+      res.json = function(data) {
+        if (res.statusCode === 200) {
+          responseCache.set(key, {
+            data,
+            timestamp: Date.now()
+          });
+          
+          // Clean up old cache entries
+          if (responseCache.size % 100 === 0) {
+            cleanupCache();
+          }
+        }
+        originalJson.call(this, data);
+      };
+      
+      next();
+    };
+  };
+
+  // Cache cleanup function
+  const cleanupCache = () => {
+    const now = Date.now();
+    for (const [key, value] of responseCache.entries()) {
+      if (now - value.timestamp > CACHE_TTL) {
+        responseCache.delete(key);
+      }
+    }
+  };
+
+  // Optimized image compression with streaming
+  async function compressImageFromBuffer(buffer, targetKB = 200) {
+    try {
+      const image = sharp(buffer);
+      const metadata = await image.metadata();
+      
+      // Calculate optimal dimensions
+      let { width, height } = metadata;
+      const maxDimension = 1920; // Max width/height
+      
+      if (width > maxDimension || height > maxDimension) {
+        const ratio = Math.min(maxDimension / width, maxDimension / height);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+      
+      let quality = 85;
+      let compressedBuffer;
+      
+      // Binary search for optimal quality
+      let minQuality = 10;
+      let maxQuality = 95;
+      
+      while (minQuality <= maxQuality) {
+        quality = Math.floor((minQuality + maxQuality) / 2);
+        
+        compressedBuffer = await image
+          .resize(width, height)
+          .jpeg({ quality, progressive: true })
+          .toBuffer();
+        
+        const sizeKB = compressedBuffer.length / 1024;
+        
+        if (sizeKB <= targetKB) {
+          minQuality = quality + 1;
+        } else {
+          maxQuality = quality - 1;
+        }
+        
+        // Break if we're close enough
+        if (Math.abs(sizeKB - targetKB) < 10) break;
+      }
+      
+      return compressedBuffer;
+    } catch (error) {
+      console.error("Error in image compression:", error);
+      throw error;
+    }
   }
-};
 
-// app.get("/caption", (req, res) => {
-//   res.sendFile(path.join(__dirname, "/public", "index.html"));
-// });
+  // Optimized caption generation with concurrency control
+  const captionQueue = [];
+  let activeCaptionRequests = 0;
+  const MAX_CONCURRENT_CAPTIONS = 5;
 
-// API route to handle image upload and caption generation
-app.post("/caption", upload.single("image"), async (req, res) => {
-  let inputPath = null;
-  let outputPath = null;
+  async function processCaptionQueue() {
+    while (captionQueue.length > 0 && activeCaptionRequests < MAX_CONCURRENT_CAPTIONS) {
+      const task = captionQueue.shift();
+      activeCaptionRequests++;
+      
+      try {
+        await task.process();
+      } catch (error) {
+        task.reject(error);
+      } finally {
+        activeCaptionRequests--;
+      }
+    }
+  }
 
-  try {
-    // Ensure upload directory exists
-    ensureUploadDir();
-
+  // Caption API with queue management
+  app.post("/caption", heavyOperationLimiter, upload.single("image"), async (req, res) => {
     if (!req.file) {
       return res.status(400).json({ 
         success: false, 
@@ -88,232 +220,224 @@ app.post("/caption", upload.single("image"), async (req, res) => {
       });
     }
 
-    inputPath = req.file.path;
-    outputPath = path.join('/tmp', `compressed-${req.file.filename}.jpeg`);
+    // Add to queue
+    const queuePromise = new Promise((resolve, reject) => {
+      captionQueue.push({
+        process: async () => {
+          try {
+            const startTime = Date.now();
+            
+            // Compress image from memory buffer
+            const compressedBuffer = await compressImageFromBuffer(req.file.buffer, 200);
+            const base64Image = compressedBuffer.toString("base64");
 
-    const buffer = await compressToTargetSize(inputPath, outputPath, 200);
-    const base64Image = buffer.toString("base64");
+            const promptText = `
+              You are a top-tier social media strategist with a flair for viral content.
+              Given an image, write exactly two highly engaging captions (1–2 sentences each), optimized for Instagram or Twitter.
+              Each caption must:
+              - Be playful and catchy using witty, humorous, or clever language.
+              - Include relevant and expressive emojis to enhance visual appeal.
+              - Use 2–3 trending or niche hashtags.
+              - Match the tone of the platform: Instagram: aesthetic, aspirational; Twitter: punchy, conversational
+              - Encourage audience interaction using questions, calls-to-action, or relatable humor.
+              Format the output clearly so each caption is easy to copy-paste for social media.
+            `;
 
-    const promptText = `
-      You are a top-tier social media strategist with a flair for viral content.
+            const body = {
+              contents: [{
+                role: "user",
+                parts: [
+                  {
+                    inline_data: {
+                      mime_type: "image/jpeg",
+                      data: base64Image,
+                    },
+                  },
+                  { text: promptText }
+                ],
+              }],
+            };
 
-      Given an image, write exactly two highly engaging captions (1–2 sentences each), optimized for Instagram or Twitter.
+            const response = await axios.post(
+              `${process.env.GEMINI_API1_LINK}?key=${process.env.GEMINI_API_KEY}`,
+              body,
+              {
+                headers: { "Content-Type": "application/json" },
+                timeout: 15000 // Reduced timeout
+              }
+            );
 
-      Each caption must:
-      - Be playful and catchy using witty, humorous, or clever language.
-      - Include relevant and expressive emojis to enhance visual appeal.
-      - Use 2–3 trending or niche hashtags.
-      - Match the tone of the platform:
-      - Instagram: aesthetic, aspirational
-      - Twitter: punchy, conversational
-      - Encourage audience interaction using questions, calls-to-action, or relatable humor.
-      Format the output clearly so each caption is easy to copy-paste for social media.
-    `;
+            const caption = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+            const processingTime = Date.now() - startTime;
 
-    const body = {
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              inline_data: {
-                mime_type: "image/jpeg",
-                data: base64Image,
-              },
-            },
-            {
-              text: promptText,
-            },
-          ],
+            if (caption) {
+              resolve({ 
+                success: true, 
+                caption,
+                processingTime: `${processingTime}ms`
+              });
+            } else {
+              reject(new Error("No caption returned from AI service"));
+            }
+          } catch (error) {
+            reject(error);
+          }
         },
-      ],
-    };
+        reject
+      });
+    });
 
-    if (!process.env.GEMINI_API1_LINK || !process.env.GEMINI_API_KEY) {
-      throw new Error("Missing required environment variables: GEMINI_API1_LINK or GEMINI_API_KEY");
-    }
-
-    const response = await axios.post(
-      `${process.env.GEMINI_API1_LINK}?key=${process.env.GEMINI_API_KEY}`,
-      body,
-      {
-        headers: {
-          "Content-Type": "application/json",
-        },
-        timeout: 30000 // 30 second timeout
-      }
-    );
-
-    const caption = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    // Clean up files
-    await cleanupFile(inputPath);
-    await cleanupFile(outputPath);
-
-    if (caption) {
-      res.json({ success: true, caption });
-    } else {
+    try {
+      processCaptionQueue();
+      const result = await queuePromise;
+      res.json(result);
+    } catch (error) {
+      console.error("❌ Error in /caption:", error.message);
       res.status(500).json({ 
         success: false, 
-        message: "No caption returned from AI service" 
+        error: error.message || "Caption generation failed"
       });
     }
-  } catch (err) {
-    console.error("❌ Error in /api/caption:", err.response?.data || err.message);
-    
-    // Clean up files in case of error
-    if (inputPath) await cleanupFile(inputPath);
-    if (outputPath) await cleanupFile(outputPath);
+  });
 
-    const errorMessage = err.response?.data?.error?.message || err.message || "Unknown error occurred";
-    res.status(500).json({ 
-      success: false, 
-      error: errorMessage 
-    });
-  }
-});
-
-// Function to summarize YouTube video
-async function summarizeYouTubeVideo(videoId) {
-  try {
-    console.log(`🎥 Processing video ID: ${videoId}`);
+  // Optimized YouTube summarization with caching
+  async function summarizeYouTubeVideo(videoId) {
+    const startTime = Date.now();
     
-    let transcriptData;
-    let usedLanguage;
-    
-    // 1. Try to fetch Hindi transcript first, then fallback to English
     try {
-      console.log('Attempting to fetch Hindi transcript...');
-      transcriptData = await getSubtitles({ videoID: videoId, lang: 'hi' });
-      usedLanguage = 'Hindi';
-      console.log('✅ Hindi transcript found');
-    } catch (error) {
-      console.log('❌ Hindi transcript not available, trying English...');
-      try {
-        transcriptData = await getSubtitles({ videoID: videoId, lang: 'en' });
-        usedLanguage = 'English';
-        console.log('✅ English transcript found');
-      } catch (englishError) {
-        console.log('❌ English transcript also not available, trying auto-generated...');
+      console.log(`🎥 Processing video ID: ${videoId}`);
+      
+      // Try multiple transcript languages with timeout
+      const transcriptPromises = [
+        { lang: 'hi', name: 'Hindi' },
+        { lang: 'en', name: 'English' },
+        { lang: null, name: 'Auto-detected' }
+      ];
+
+      let transcriptData;
+      let usedLanguage;
+
+      for (const { lang, name } of transcriptPromises) {
         try {
-          transcriptData = await getSubtitles({ videoID: videoId });
-          usedLanguage = 'Auto-detected';
-          console.log('✅ Auto-generated transcript found');
-        } catch (autoError) {
-          throw new Error('No transcript found in Hindi, English, or auto-generated formats.');
-        }
-      }
-    }
-    
-    if (!transcriptData || transcriptData.length === 0) {
-      throw new Error('No transcript data available for this video.');
-    }
-    
-    const transcriptText = transcriptData.map(item => item.text).join(' ');
-    console.log(`✅ Transcript found (${usedLanguage}): ${transcriptText.length} characters`);
-    
-    // 2. Prepare prompt for Gemini based on language used
-    let prompt;
-    if (usedLanguage === 'Hindi') {
-      prompt = `Summarize the following Hindi transcript of a YouTube video in Hindi:\n\n${transcriptText}`;
-    } else {
-      prompt = `Summarize the following English transcript of a YouTube video:\n\n${transcriptText}`;
-    }
-    
-    // 3. Call Gemini API (using updated model name)
-    console.log('🤖 Generating summary with Gemini...');
-    
-    // Try different model names
-    const modelNames = ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro'];
-    let geminiResponse;
-    let usedModel;
-    
-    for (const modelName of modelNames) {
-      try {
-        console.log(`Trying model: ${modelName}`);
-        geminiResponse = await axios.post(
-          `${process.env.GEMINI_API2_LINK}/${modelName}:generateContent?key=${process.env.GEMINI_API_KEY}`,
-          {
-            contents: [
-              {
-                parts: [{ text: prompt }]
-              }
-            ]
-          },
-          {
-            headers: {
-              'Content-Type': 'application/json'
-            }
-          }
-        );
-        usedModel = modelName;
-        console.log(`✅ Successfully used model: ${modelName}`);
-        break;
-      } catch (error) {
-        if (error.response?.status === 404) {
-          console.log(`❌ Model ${modelName} not found, trying next...`);
+          console.log(`Trying ${name} transcript...`);
+          const timeoutPromise = new Promise((_, reject) => {
+            setTimeout(() => reject(new Error('Timeout')), 10000);
+          });
+          
+          const transcriptPromise = lang ? 
+            getSubtitles({ videoID: videoId, lang }) : 
+            getSubtitles({ videoID: videoId });
+          
+          transcriptData = await Promise.race([transcriptPromise, timeoutPromise]);
+          usedLanguage = name;
+          console.log(`✅ ${name} transcript found`);
+          break;
+        } catch (error) {
+          console.log(`❌ ${name} transcript failed:`, error.message);
           continue;
-        } else {
-          throw error; // For non-404 errors, throw immediately
         }
       }
+
+      if (!transcriptData || transcriptData.length === 0) {
+        throw new Error('No transcript available for this video');
+      }
+
+      const transcriptText = transcriptData.map(item => item.text).join(' ');
+      
+      // Truncate very long transcripts for faster processing
+      const maxLength = 8000;
+      const finalTranscript = transcriptText.length > maxLength ? 
+        transcriptText.substring(0, maxLength) + '...' : transcriptText;
+
+      console.log(`✅ Using ${usedLanguage} transcript: ${finalTranscript.length} characters`);
+
+      const prompt = `Provide a concise summary of this YouTube video transcript in 3-4 key points:\n\n${finalTranscript}`;
+
+      // Use the most reliable model first
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
+        {
+          contents: [{
+            parts: [{ text: prompt }]
+          }],
+          generationConfig: {
+            maxOutputTokens: 500, // Limit response length
+            temperature: 0.3
+          }
+        },
+        {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 15000
+        }
+      );
+
+      const summary = response.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No summary generated.';
+      const processingTime = Date.now() - startTime;
+
+      return {
+        summary,
+        transcriptLanguage: usedLanguage,
+        processingTime: `${processingTime}ms`
+      };
+
+    } catch (error) {
+      console.error('❌ Error summarizing video:', error.message);
+      throw error;
     }
-    
-    if (!geminiResponse) {
-      throw new Error('All Gemini models failed');
-    }
-    
-    // 4. Extract and return summary
-    const summary = geminiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text || 'No summary generated.';
-    
-    console.log(`\n📊 Summary generated using ${usedModel} for ${usedLanguage} transcript:`);
-    return {
-      summary,
-      transcriptLanguage: usedLanguage,
-      modelUsed: usedModel
-    };
-    
-  } catch (error) {
-    console.error('❌ Error summarizing video:', error.message || error);
-    throw error;
   }
+
+  // YouTube summary API with caching
+  app.post('/summarize', 
+    heavyOperationLimiter,
+    cacheMiddleware(req => `summary_${req.body.videoId}`),
+    async (req, res) => {
+      try {
+        const { videoId } = req.body;
+        
+        if (!videoId) {
+          return res.status(400).json({ error: 'videoId is required' });
+        }
+
+        // Basic validation for YouTube video ID format
+        if (!/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+          return res.status(400).json({ error: 'Invalid YouTube video ID format' });
+        }
+
+        const result = await summarizeYouTubeVideo(videoId);
+        
+        res.json({
+          videoId,
+          summary: result.summary,
+          transcriptLanguage: result.transcriptLanguage,
+          processingTime: result.processingTime,
+          success: true
+        });
+        
+      } catch (error) {
+        console.error('❌ Summarize error:', error.message);
+        res.status(500).json({
+          error: error.message,
+          success: false
+        });
+      }
+    }
+  );
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('📴 SIGTERM received, shutting down gracefully');
+    process.exit(0);
+  });
+
+  process.on('SIGINT', () => {
+    console.log('📴 SIGINT received, shutting down gracefully');
+    process.exit(0);
+  });
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Worker ${process.pid} running at http://localhost:${PORT}`);
+    console.log(`📊 Server optimized for ${numCPUs} CPU cores`);
+  });
 }
-
-// app.get("/summarize", (req, res) => {
-//   res.sendFile(path.join(__dirname, "/public", "summary.html"));
-// });
-
-
-// API endpoint for summarizing
-// API endpoint
-app.post('/summarize', async (req, res) => {
-  try {
-    const { videoId } = req.body;
-    
-    if (!videoId) {
-      return res.status(400).json({ error: 'videoId is required' });
-    }
-    
-    const result = await summarizeYouTubeVideo(videoId);
-    
-    res.json({
-      videoId,
-      summary: result.summary,
-      transcriptLanguage: result.transcriptLanguage,
-      modelUsed: result.modelUsed,
-      success: true
-    });
-    
-  } catch (error) {
-    res.status(500).json({
-      error: error.message,
-      success: false
-    });
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
-});
 
 module.exports = app;
